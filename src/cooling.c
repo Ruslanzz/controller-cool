@@ -67,24 +67,55 @@ typedef struct {
 
   uint8_t  retries;      /* повторных пусков после аварии подряд            */
   uint16_t trips;        /* всего срабатываний защиты                       */
+
+  uint8_t  start_count;  /* «дырявый» счётчик пусков                        */
+  uint32_t decay_tick;   /* отметка последнего распада счётчика пусков      */
+  uint32_t cooldown_tick;/* начало паузы по частоте пусков, 0 — паузы нет   */
 } FanRt;
 
 static FanRt fan[FAN_COUNT];
 
-/* Команда ведущего и момент её последнего фронта включения — по нему
+/* --- Команда: сырая (из CAN) -> после антидребезга -> эффективная ---------
+ * Сырое значение приходит из прерывания приёма CAN. Устойчивым оно считается
+ * только продержавшись FAN_CMD_DEBOUNCE_MS: дребезг механического контакта
+ * deadman на ведущем не должен доходить до силовой части. Эффективная команда
+ * — устойчивая И снятая тепловой защитой; по фронту её включения
  * отсчитывается разнос пусков двух вентиляторов.                            */
-static volatile uint8_t  fan_command   = 0;
-static volatile uint32_t fan_cmd_tick  = 0;
+static volatile uint8_t  cmd_raw          = 0;
+static volatile uint32_t cmd_raw_tick     = 0;
+static uint8_t           cmd_stable       = 0;
+static uint8_t           cmd_effective    = 0;
+static uint32_t          cmd_effective_tick = 0;
+
+/* --- Тепловая защита платы ----------------------------------------------- */
+static uint8_t  thermal_shutdown = 0;
+static uint8_t  temp_valid[2]    = {0, 0};
+static uint8_t  temp_over[2]     = {0, 0};
+static uint32_t temp_over_since[2] = {0, 0};
+
+static const uint8_t temp_idx[2] = { TEMP_SENS_1_IDX, TEMP_SENS_2_IDX };
 
 /* ==========================================================================
  * Низкий уровень: мост и разрешение драйвера.
  * ========================================================================== */
 
 /* Выставить скважность на регулируемом плече. Плечо IN_B держится открытым,
- * поэтому duty_q = 0 -> оба плеча подняты -> контур циркуляции замкнут.     */
+ * поэтому duty_q = 0 -> оба плеча подняты -> контур циркуляции замкнут.
+ *
+ * Слишком короткие импульсы не выдаются вовсе. В начале разгона расчётная
+ * длительность падает до единиц наносекунд — драйвер за такое время не успеет
+ * полностью открыть ключ, и тот окажется в линейном режиме, рассеивая всю
+ * мощность на кристалле. Отсечка симметрична: и «чуть-чуть открыт», и
+ * «почти полностью открыт» приводятся к ближайшему крайнему состоянию.      */
 static void Fan_ApplyDuty(uint8_t i)
 {
   uint32_t on = ((uint32_t)PWM_PERIOD * fan[i].duty_q) / DUTY_MAX_Q;
+
+  if (on < FAN_PWM_MIN_PULSE) {
+    on = 0;                                   /* закрыто, без огрызка       */
+  } else if (on > (uint32_t)(PWM_PERIOD - FAN_PWM_MIN_PULSE)) {
+    on = PWM_PERIOD;                          /* открыто полностью          */
+  }
 
   __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_b, PWM_PERIOD);
   __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_a, PWM_PERIOD - on);
@@ -178,11 +209,67 @@ static void Fan_BeginStop(uint8_t i, uint32_t now)
   Fan_EnterState(i, FAN_STATE_STOPPING, now);
 }
 
-/* Начать разгон к рабочей скважности (мост уже под разрешением). */
-static void Fan_BeginStart(uint8_t i, uint32_t now)
+/* --------------------------------------------------------------------------
+ * Ограничитель частоты пусков.
+ *
+ * Каждый пуск — всплеск тока и порция тепла в ключах моста. Счётчик пусков
+ * «дырявый»: пуск добавляет 1, каждые FAN_CYCLE_DECAY_MS вычитается 1.
+ * Набралось FAN_CYCLE_LIMIT — канал уходит в паузу FAN_CYCLE_COOLDOWN_MS,
+ * за которую кристалл успевает остыть. Редкие штатные включения до лимита
+ * не доходят никогда.
+ * -------------------------------------------------------------------------- */
+static uint8_t Fan_InCooldown(uint8_t i, uint32_t now)
 {
+  if (fan[i].cooldown_tick == 0) {
+    return 0;
+  }
+  if ((now - fan[i].cooldown_tick) < FAN_CYCLE_COOLDOWN_MS) {
+    return 1;
+  }
+  /* Пауза выдержана — счётчик обнуляется, но если дребезг не прекратился,
+   * следующая пачка пусков заново упрётся в лимит.                         */
+  fan[i].cooldown_tick = 0;
+  fan[i].start_count   = 0;
+  return 0;
+}
+
+/* Плавный распад счётчика пусков. */
+static void Fan_DecayStartCount(uint8_t i, uint32_t now)
+{
+  if ((now - fan[i].decay_tick) < FAN_CYCLE_DECAY_MS) {
+    return;
+  }
+  fan[i].decay_tick = now;
+  if (fan[i].start_count > 0) {
+    fan[i].start_count--;
+  }
+}
+
+/* Разрешён ли пуск прямо сейчас. Разрешение РАСХОДУЕТ кредит счётчика, поэтому
+ * вызывается ровно один раз на пуск.                                        */
+static uint8_t Fan_StartAllowed(uint8_t i, uint32_t now)
+{
+  if (Fan_InCooldown(i, now)) {
+    return 0;
+  }
+  if (fan[i].start_count >= FAN_CYCLE_LIMIT) {
+    fan[i].cooldown_tick = (now != 0) ? now : 1;
+    return 0;
+  }
+  fan[i].start_count++;
+  return 1;
+}
+
+/* Начать разгон к рабочей скважности (мост уже под разрешением).
+ * Возвращает 0, если пуск запрещён ограничителем частоты.                   */
+static uint8_t Fan_BeginStart(uint8_t i, uint32_t now)
+{
+  if (!Fan_StartAllowed(i, now)) {
+    return 0;
+  }
   Fan_StartRamp(i, DUTY_TARGET_Q, FAN_RAMP_UP_MS, now);
   Fan_EnterState(i, FAN_STATE_STARTING, now);
+  return 1;
 }
 
 /* Аварийное отключение канала.
@@ -220,6 +307,11 @@ void Cooling_Init(void)
     fan[i].retries    = 0;
     fan[i].trips      = 0;
     fan[i].state_tick = HAL_GetTick();
+
+    fan[i].start_count   = 0;
+    fan[i].decay_tick    = HAL_GetTick();
+    fan[i].cooldown_tick = 0;
+
     Fan_ResetProtection(i);
 
     /* Сначала безопасное положение плеч, только потом (в автомате) EN. */
@@ -265,10 +357,31 @@ void Cooling_SetCommand(uint8_t on)
 {
   uint8_t cmd = (on != 0);
 
-  if (cmd && !fan_command) {
-    fan_cmd_tick = HAL_GetTick();   /* фронт включения — отсчёт разноса пусков */
+  /* Здесь только фиксируем сырое значение и момент его изменения; решение
+   * принимает антидребезг в Cooling_Update.                                */
+  if (cmd != cmd_raw) {
+    cmd_raw      = cmd;
+    cmd_raw_tick = HAL_GetTick();
   }
-  fan_command = cmd;
+}
+
+/* Антидребезг команды: сырое значение становится устойчивым, только
+ * продержавшись FAN_CMD_DEBOUNCE_MS. Дребезг контакта deadman на ведущем
+ * иначе превратился бы в пачку пусков и остановов силовой части.           */
+static void Cooling_UpdateCommand(uint32_t now)
+{
+  if (cmd_raw != cmd_stable && (now - cmd_raw_tick) >= FAN_CMD_DEBOUNCE_MS) {
+    cmd_stable = cmd_raw;
+  }
+
+  /* Эффективная команда: устойчивая и не снятая тепловой защитой. Фронт её
+   * включения — точка отсчёта разноса пусков; поэтому после снятия перегрева
+   * вентиляторы снова стартуют вразнобой, а не оба разом.                  */
+  uint8_t eff = (uint8_t)(cmd_stable && !thermal_shutdown);
+  if (eff && !cmd_effective) {
+    cmd_effective_tick = now;
+  }
+  cmd_effective = eff;
 }
 
 /* Команда конкретному каналу. Второй вентилятор стартует на FAN_STAGGER_MS
@@ -276,13 +389,75 @@ void Cooling_SetCommand(uint8_t on)
  * питании. На выключение разнос не действует — останов синхронный.          */
 static uint8_t Fan_Command(uint8_t i, uint32_t now)
 {
-  if (!fan_command) {
+  if (!cmd_effective) {
     return 0;
   }
   if (i == 0) {
     return 1;
   }
-  return ((now - fan_cmd_tick) >= FAN_STAGGER_MS) ? 1 : 0;
+  return ((now - cmd_effective_tick) >= FAN_STAGGER_MS) ? 1 : 0;
+}
+
+/* ==========================================================================
+ * Тепловая защита платы.
+ *
+ * Датчики меряют плату, которую греют сами ключи мостов, поэтому останов
+ * вентиляторов действительно снижает температуру — снимается рассеиваемая
+ * мощность. Перегрев любого ИСПРАВНОГО датчика останавливает оба канала:
+ * припой, электролиты и МК — общие для платы, а два остановленных канала
+ * остывают быстрее одного.
+ * ========================================================================== */
+
+void Cooling_CheckTemperature(void)
+{
+  static uint32_t sample_tick = 0;
+
+  uint32_t now = HAL_GetTick();
+
+  if ((now - sample_tick) < TEMP_SAMPLE_MS) {
+    return;
+  }
+  sample_tick = now;
+
+  uint8_t any_over = 0;
+
+  for (uint8_t s = 0; s < 2; s++) {
+    uint32_t adc = ADS_RES_BUFFER[temp_idx[s]];
+
+    /* Оборванный (отсчёт у потолка) или закороченный (у нуля) датчик.
+     * По такому показанию НЕ отключаем: остановленное охлаждение опаснее
+     * неизвестной температуры. Второй датчик продолжает защищать.          */
+    if (adc < TEMP_VALID_MIN_ADC || adc > TEMP_VALID_MAX_ADC) {
+      temp_valid[s]      = 0;
+      temp_over[s]       = 0;
+      temp_over_since[s] = 0;
+      continue;
+    }
+    temp_valid[s] = 1;
+
+    if (TEMP_HOTTER(adc, TEMP_TRIP_ADC)) {
+      /* Выше порога отключения — с выдержкой, чтобы одиночная выборка не
+       * останавливала охлаждение.                                          */
+      if (temp_over_since[s] == 0) {
+        temp_over_since[s] = (now != 0) ? now : 1;
+      } else if ((now - temp_over_since[s]) >= TEMP_TRIP_MS) {
+        temp_over[s] = 1;
+      }
+    } else if (!TEMP_HOTTER(adc, TEMP_CLEAR_ADC)) {
+      /* Ниже порога возврата — перегрев снят. */
+      temp_over[s]       = 0;
+      temp_over_since[s] = 0;
+    } else {
+      /* Между порогами: держим текущее состояние (гистерезис 20 °C). */
+      temp_over_since[s] = 0;
+    }
+
+    if (temp_over[s]) {
+      any_over = 1;
+    }
+  }
+
+  thermal_shutdown = any_over;
 }
 
 /* ==========================================================================
@@ -293,17 +468,23 @@ static void Fan_Step(uint8_t i, uint32_t now)
 {
   uint8_t cmd = Fan_Command(i, now);
 
+  Fan_DecayStartCount(i, now);
+
   switch (fan[i].state) {
 
     case FAN_STATE_OFF:
-      /* Мост обесточен. Пуск — только после паузы, за которую драйвер
-       * гарантированно разрядился.                                         */
-      if (cmd && (now - fan[i].state_tick) >= FAN_RESTART_DELAY_MS) {
+      /* Мост обесточен. Пуск — только после FAN_MIN_OFF_MS: за эту паузу
+       * разряжаются бутстрепные ёмкости верхних ключей и затворные цепи
+       * приходят в определённое состояние. Пуск на недозаряженном бутстрепе
+       * держит верхний ключ в линейном режиме — это его и пробивает.       */
+      if (cmd && (now - fan[i].state_tick) >= FAN_MIN_OFF_MS &&
+          Fan_StartAllowed(i, now)) {
         fan[i].duty_q = 0;
         Fan_ApplyDuty(i);        /* безопасное положение плеч до подачи EN  */
         Fan_EnableDriver(i);
         Fan_ResetProtection(i);
-        Fan_BeginStart(i, now);
+        Fan_StartRamp(i, DUTY_TARGET_Q, FAN_RAMP_UP_MS, now);
+        Fan_EnterState(i, FAN_STATE_STARTING, now);
       }
       break;
 
@@ -331,9 +512,9 @@ static void Fan_Step(uint8_t i, uint32_t now)
 
     case FAN_STATE_STOPPING:
       /* Команду вернули посреди выбега — плавно уходим обратно в разгон,
-       * EN снимать не начинали.                                            */
-      if (cmd) {
-        Fan_BeginStart(i, now);
+       * EN снимать не начинали. Если ограничитель частоты пусков не пустил,
+       * останов продолжается: бросать канал на полпути нельзя.             */
+      if (cmd && Fan_BeginStart(i, now)) {
         break;
       }
       if (Fan_StepRamp(i, now)) {
@@ -348,8 +529,10 @@ static void Fan_Step(uint8_t i, uint32_t now)
       fan[i].duty_q = 0;
       Fan_ApplyDuty(i);
 
-      if (cmd) {
-        Fan_BeginStart(i, now);  /* мост под разрешением — можно сразу      */
+      /* Мост под разрешением — повторный пуск можно начать сразу, бутстреп
+       * не разряжался. Но пуск всё равно проходит через ограничитель
+       * частоты: именно дребезг команды и создаёт цикл «стоп-пуск».        */
+      if (cmd && Fan_BeginStart(i, now)) {
         break;
       }
       if ((now - fan[i].state_tick) >= FAN_DECAY_MS) {
@@ -395,6 +578,8 @@ static void Fan_Step(uint8_t i, uint32_t now)
 void Cooling_Update(void)
 {
   uint32_t now = HAL_GetTick();
+
+  Cooling_UpdateCommand(now);
 
   for (uint8_t i = 0; i < FAN_COUNT; i++) {
     Fan_Step(i, now);
@@ -509,8 +694,25 @@ void Cooling_GetStatus(uint8_t fan_index, FanStatus *out)
   out->duty_pct   = (uint16_t)(fan[fan_index].duty_q / DUTY_SCALE);
   out->i_avg_adc  = (uint16_t)Fan_AvgCurrent(fan_index);
   out->zero_adc   = (uint16_t)fan[fan_index].zero_adc;
-  out->zero_valid = fan[fan_index].zero_valid;
-  out->retries    = fan[fan_index].retries;
-  out->trips      = fan[fan_index].trips;
-  out->enabled    = fan[fan_index].enabled;
+  out->zero_valid  = fan[fan_index].zero_valid;
+  out->retries     = fan[fan_index].retries;
+  out->trips       = fan[fan_index].trips;
+  out->enabled     = fan[fan_index].enabled;
+  out->start_count = fan[fan_index].start_count;
+  out->cooldown    = (uint8_t)(fan[fan_index].cooldown_tick != 0);
+}
+
+void Cooling_GetGlobalStatus(CoolingStatus *out)
+{
+  if (out == 0) {
+    return;
+  }
+
+  out->thermal_shutdown = thermal_shutdown;
+  out->temp_valid[0]    = temp_valid[0];
+  out->temp_valid[1]    = temp_valid[1];
+  out->temp_over[0]     = temp_over[0];
+  out->temp_over[1]     = temp_over[1];
+  out->cmd_raw          = cmd_raw;
+  out->cmd_active       = cmd_effective;
 }

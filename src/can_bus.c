@@ -125,6 +125,14 @@ void CanBus_TxTask(void)
  *   0x5A3 — нули датчиков тока (LE16), счётчики срабатываний защиты и
  *     повторных пусков по каналам.
  *
+ *   0x5A4 — тепловая защита и ограничитель частоты пусков:
+ *     [0] флаги: бит 0 — тепловое отключение активно; биты 1/2 — датчик
+ *         температуры 1/2 исправен; биты 3/4 — датчик 1/2 подтвердил
+ *         перегрев; бит 5 — сырая команда из CAN; бит 6 — эффективная
+ *         команда (после антидребезга и тепловой защиты);
+ *     [1] счётчик пусков канала 1, [2] — канала 2;
+ *     [3] биты 0/1 — канал 1/2 в паузе по частоте пусков.
+ *
  * Пересчёт тока в амперы: I = (значение) / ACS724_ADC_PER_AMP.
  * -------------------------------------------------------------------------- */
 static void CanBus_SendDebugFrame(void)
@@ -165,7 +173,7 @@ static void CanBus_SendDebugFrame(void)
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 2), data_adc, 8);
       break;
     }
-    default: {
+    case 2: {
       uint8_t data_cal[8] = {
         (uint8_t)(f1.zero_adc & 0xFF), (uint8_t)(f1.zero_adc >> 8),
         (uint8_t)(f2.zero_adc & 0xFF), (uint8_t)(f2.zero_adc >> 8),
@@ -176,9 +184,29 @@ static void CanBus_SendDebugFrame(void)
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 3), data_cal, 8);
       break;
     }
+    default: {
+      CoolingStatus cs = {0};
+      Cooling_GetGlobalStatus(&cs);
+
+      uint8_t flags = (uint8_t)((cs.thermal_shutdown ? 0x01 : 0) |
+                                (cs.temp_valid[0]    ? 0x02 : 0) |
+                                (cs.temp_valid[1]    ? 0x04 : 0) |
+                                (cs.temp_over[0]     ? 0x08 : 0) |
+                                (cs.temp_over[1]     ? 0x10 : 0) |
+                                (cs.cmd_raw          ? 0x20 : 0) |
+                                (cs.cmd_active       ? 0x40 : 0));
+      uint8_t data_th[4] = {
+        flags,
+        f1.start_count,
+        f2.start_count,
+        (uint8_t)((f1.cooldown ? 0x01 : 0) | (f2.cooldown ? 0x02 : 0))
+      };
+      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 4);
+      break;
+    }
   }
 
-  dbg_sel = (uint8_t)((dbg_sel + 1) % 3);
+  dbg_sel = (uint8_t)((dbg_sel + 1) % 4);
 }
 
 /* --------------------------------------------------------------------------
