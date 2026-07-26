@@ -131,7 +131,9 @@ void CanBus_TxTask(void)
  *         перегрев; бит 5 — сырая команда из CAN; бит 6 — эффективная
  *         команда (после антидребезга и тепловой защиты);
  *     [1] счётчик пусков канала 1, [2] — канала 2;
- *     [3] биты 0/1 — канал 1/2 в паузе по частоте пусков.
+ *     [3] биты 0/1 — канал 1/2 в паузе по частоте пусков;
+ *     [4]/[5] — оценка оборотов выбегающей крыльчатки канала 1/2, % от
+ *         рабочей точки (0 — крыльчатка стоит).
  *
  * Пересчёт тока в амперы: I = (значение) / ACS724_ADC_PER_AMP.
  * -------------------------------------------------------------------------- */
@@ -195,13 +197,15 @@ static void CanBus_SendDebugFrame(void)
                                 (cs.temp_over[1]     ? 0x10 : 0) |
                                 (cs.cmd_raw          ? 0x20 : 0) |
                                 (cs.cmd_active       ? 0x40 : 0));
-      uint8_t data_th[4] = {
+      uint8_t data_th[6] = {
         flags,
         f1.start_count,
         f2.start_count,
-        (uint8_t)((f1.cooldown ? 0x01 : 0) | (f2.cooldown ? 0x02 : 0))
+        (uint8_t)((f1.cooldown ? 0x01 : 0) | (f2.cooldown ? 0x02 : 0)),
+        (uint8_t)f1.coast_pct,   /* оценка оборотов выбегающей крыльчатки */
+        (uint8_t)f2.coast_pct
       };
-      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 4);
+      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 6);
       break;
     }
   }
