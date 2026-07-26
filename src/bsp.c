@@ -279,13 +279,13 @@ static void MX_TIM4_Init(void)
   TIM_OC_InitTypeDef sConfigOC = {0};
 
   htim4.Instance = TIM4;
-  /* Без предделителя: 72 МГц / 4500 = 16 кГц. Нагрузка индуктивная —
-   * частота выбрана так, чтобы ток якоря оставался непрерывным (см. PWM_PERIOD
-   * в config.h). Если силовой полумост не тянет такие фронты, частоту снижают
-   * предделителем, но не ниже ~4 кГц. */
+  /* Без предделителя: 72 МГц / 9000 = 8 кГц. Частота выбрана по тепловому
+   * балансу ключей — снизу её держит пульсация тока якоря, сверху потери
+   * переключения; полный расчёт см. у PWM_PERIOD в config.h. Менять её,
+   * не пересчитав потери и не проверив FAN_PWM_MIN_PULSE, нельзя. */
   htim4.Init.Prescaler = 1-1;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = PWM_PERIOD-1;   /* 72 МГц / 1 / 4500 = 16 кГц */
+  htim4.Init.Period = PWM_PERIOD-1;   /* 72 МГц / 1 / 9000 = 8 кГц */
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
