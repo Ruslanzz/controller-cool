@@ -27,6 +27,7 @@
 #include "cooling.h"
 #include "config.h"
 #include "bsp.h"
+#include "thermal.h"
 
 /* Скважность хранится в сотых долях процента: шаг разгона получается плавным
  * без накопления ошибки целочисленного деления.                             */
@@ -105,14 +106,6 @@ static volatile uint32_t cmd_raw_tick     = 0;
 static uint8_t           cmd_stable       = 0;
 static uint8_t           cmd_effective    = 0;
 static uint32_t          cmd_effective_tick = 0;
-
-/* --- Тепловая защита платы ----------------------------------------------- */
-static uint8_t  thermal_shutdown = 0;
-static uint8_t  temp_valid[2]    = {0, 0};
-static uint8_t  temp_over[2]     = {0, 0};
-static uint32_t temp_over_since[2] = {0, 0};
-
-static const uint8_t temp_idx[2] = { TEMP_SENS_1_IDX, TEMP_SENS_2_IDX };
 
 /* --- Запрет пуска сразу после сброса МК -----------------------------------
  * Если МК перезагрузился на ходу (просадка питания, watchdog, перепрошивка),
@@ -543,7 +536,7 @@ static void Cooling_UpdateCommand(uint32_t now)
   /* Эффективная команда: устойчивая и не снятая тепловой защитой. Фронт её
    * включения — точка отсчёта разноса пусков; поэтому после снятия перегрева
    * вентиляторы снова стартуют вразнобой, а не оба разом.                  */
-  uint8_t eff = (uint8_t)(cmd_stable && !thermal_shutdown);
+  uint8_t eff = (uint8_t)(cmd_stable && !Thermal_Limit());
   if (eff && !cmd_effective) {
     cmd_effective_tick = now;
   }
@@ -564,67 +557,6 @@ static uint8_t Fan_Command(uint8_t i, uint32_t now)
   return ((now - cmd_effective_tick) >= FAN_STAGGER_MS) ? 1 : 0;
 }
 
-/* ==========================================================================
- * Тепловая защита платы.
- *
- * Датчики меряют плату, которую греют сами ключи мостов, поэтому останов
- * вентиляторов действительно снижает температуру — снимается рассеиваемая
- * мощность. Перегрев любого ИСПРАВНОГО датчика останавливает оба канала:
- * припой, электролиты и МК — общие для платы, а два остановленных канала
- * остывают быстрее одного.
- * ========================================================================== */
-
-void Cooling_CheckTemperature(void)
-{
-  static uint32_t sample_tick = 0;
-
-  uint32_t now = HAL_GetTick();
-
-  if ((now - sample_tick) < TEMP_SAMPLE_MS) {
-    return;
-  }
-  sample_tick = now;
-
-  uint8_t any_over = 0;
-
-  for (uint8_t s = 0; s < 2; s++) {
-    uint32_t adc = ADS_RES_BUFFER[temp_idx[s]];
-
-    /* Оборванный (отсчёт у потолка) или закороченный (у нуля) датчик.
-     * По такому показанию НЕ отключаем: остановленное охлаждение опаснее
-     * неизвестной температуры. Второй датчик продолжает защищать.          */
-    if (adc < TEMP_VALID_MIN_ADC || adc > TEMP_VALID_MAX_ADC) {
-      temp_valid[s]      = 0;
-      temp_over[s]       = 0;
-      temp_over_since[s] = 0;
-      continue;
-    }
-    temp_valid[s] = 1;
-
-    if (TEMP_HOTTER(adc, TEMP_TRIP_ADC)) {
-      /* Выше порога отключения — с выдержкой, чтобы одиночная выборка не
-       * останавливала охлаждение.                                          */
-      if (temp_over_since[s] == 0) {
-        temp_over_since[s] = (now != 0) ? now : 1;
-      } else if ((now - temp_over_since[s]) >= TEMP_TRIP_MS) {
-        temp_over[s] = 1;
-      }
-    } else if (!TEMP_HOTTER(adc, TEMP_CLEAR_ADC)) {
-      /* Ниже порога возврата — перегрев снят. */
-      temp_over[s]       = 0;
-      temp_over_since[s] = 0;
-    } else {
-      /* Между порогами: держим текущее состояние (гистерезис 20 °C). */
-      temp_over_since[s] = 0;
-    }
-
-    if (temp_over[s]) {
-      any_over = 1;
-    }
-  }
-
-  thermal_shutdown = any_over;
-}
 
 /* ==========================================================================
  * Автомат канала.
@@ -942,11 +874,19 @@ void Cooling_GetGlobalStatus(CoolingStatus *out)
     return;
   }
 
-  out->thermal_shutdown = thermal_shutdown;
-  out->temp_valid[0]    = temp_valid[0];
-  out->temp_valid[1]    = temp_valid[1];
-  out->temp_over[0]     = temp_over[0];
-  out->temp_over[1]     = temp_over[1];
+  ThermalStatus th = {0};
+  Thermal_GetStatus(&th);
+
+  out->thermal_shutdown = th.limit;
+  out->temp_valid[0]    = th.valid[0];
+  out->temp_valid[1]    = th.valid[1];
+  out->temp_over[0]     = th.over[0];
+  out->temp_over[1]     = th.over[1];
+  out->temp_c[0]        = th.temp_c[0];
+  out->temp_c[1]        = th.temp_c[1];
+  out->trip_c           = th.trip_c;
+  out->clear_c          = th.clear_c;
+  out->no_sensor        = th.no_sensor;
   out->cmd_raw          = cmd_raw;
   out->cmd_active       = cmd_effective;
 }

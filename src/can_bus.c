@@ -19,6 +19,7 @@
 #include "bsp.h"
 #include "io.h"
 #include "cooling.h"
+#include "thermal.h"
 
 /* Заголовки и буферы передачи/приёма. */
 static CAN_TxHeaderTypeDef TxHeader_Std;
@@ -135,11 +136,20 @@ void CanBus_TxTask(void)
  *     [0] флаги: бит 0 — тепловое отключение активно; биты 1/2 — датчик
  *         температуры 1/2 исправен; биты 3/4 — датчик 1/2 подтвердил
  *         перегрев; бит 5 — сырая команда из CAN; бит 6 — эффективная
- *         команда (после антидребезга и тепловой защиты);
+ *         команда (после антидребезга и тепловой защиты); бит 7 — оба
+ *         датчика температуры негодны (защищать нечем);
  *     [1] счётчик пусков канала 1, [2] — канала 2;
  *     [3] биты 0/1 — канал 1/2 в паузе по частоте пусков;
  *     [4]/[5] — оценка оборотов выбегающей крыльчатки канала 1/2, % от
- *         рабочей точки (0 — крыльчатка стоит).
+ *         рабочей точки (0 — крыльчатка стоит);
+ *     [6]/[7] — температура датчика 1/2, °C (знаковая; -127 — датчик негоден).
+ *
+ *   0x5A6 — ДЕЙСТВУЮЩИЕ пороги тепловой защиты: [0] порог срабатывания, °C,
+ *     [1] порог возврата, °C, [2] температура датчика 1, [3] датчика 2,
+ *     [4..5] пороги в отсчётах АЦП (LE16, срабатывание), [6] счётчик
+ *     восстановлений испорченной пары порогов. Кадр нужен потому, что пороги
+ *     ПЕРЕМЕННЫЕ: их можно менять на ходу (Thermal_SetTripC), и без телеметрии
+ *     нельзя было бы узнать, какой порог сейчас реально действует.
  *
  * Ток отдаётся в миллиамперах: масштаб датчика выводится из измеренного нуля
  * (см. config.h), поэтому пересчитывать на стороне приёмника ничего не нужно.
@@ -202,20 +212,23 @@ static void CanBus_SendDebugFrame(void)
                                 (cs.temp_valid[1]    ? 0x04 : 0) |
                                 (cs.temp_over[0]     ? 0x08 : 0) |
                                 (cs.temp_over[1]     ? 0x10 : 0) |
+                                (cs.no_sensor        ? 0x80 : 0) |
                                 (cs.cmd_raw          ? 0x20 : 0) |
                                 (cs.cmd_active       ? 0x40 : 0));
-      uint8_t data_th[6] = {
+      uint8_t data_th[8] = {
         flags,
         f1.start_count,
         f2.start_count,
         (uint8_t)((f1.cooldown ? 0x01 : 0) | (f2.cooldown ? 0x02 : 0)),
         (uint8_t)f1.coast_pct,   /* оценка оборотов выбегающей крыльчатки */
-        (uint8_t)f2.coast_pct
+        (uint8_t)f2.coast_pct,
+        (uint8_t)(int8_t)cs.temp_c[0],
+        (uint8_t)(int8_t)cs.temp_c[1]
       };
-      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 6);
+      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 8);
       break;
     }
-    default: {
+    case 4: {
       /* Судьба защиты по току: порог 0 означает, что защита канала отключена
        * (недостоверный ноль датчика или порог выше потолка измерения).      */
       uint8_t data_oc[8] = {
@@ -227,9 +240,25 @@ static void CanBus_SendDebugFrame(void)
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 5), data_oc, 8);
       break;
     }
+    default: {
+      /* Действующие пороги тепловой защиты — они переменные, см. thermal.h. */
+      ThermalStatus th = {0};
+      Thermal_GetStatus(&th);
+
+      uint8_t data_tt[7] = {
+        (uint8_t)(int8_t)th.trip_c,
+        (uint8_t)(int8_t)th.clear_c,
+        (uint8_t)(int8_t)th.temp_c[0],
+        (uint8_t)(int8_t)th.temp_c[1],
+        (uint8_t)(th.trip_adc & 0xFF), (uint8_t)(th.trip_adc >> 8),
+        (uint8_t)((th.bad_writes > 255) ? 255 : th.bad_writes)
+      };
+      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 6), data_tt, 7);
+      break;
+    }
   }
 
-  dbg_sel = (uint8_t)((dbg_sel + 1) % 5);
+  dbg_sel = (uint8_t)((dbg_sel + 1) % 6);
 }
 
 /* --------------------------------------------------------------------------

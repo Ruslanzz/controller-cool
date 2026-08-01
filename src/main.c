@@ -22,6 +22,7 @@
 #include "config.h"
 #include "io.h"
 #include "cooling.h"
+#include "thermal.h"
 #include "can_bus.h"
 
 /**
@@ -69,6 +70,10 @@ int main(void)
    * нельзя — снятый EN означает открытый верхний ключ. */
   Cooling_CalibrateCurrentSensors();
 
+  /* Тепловая защита платы по двум датчикам. Пороги отсюда — только начальные:
+   * действующие лежат в temp_trip_adc/temp_clear_adc и меняются на ходу. */
+  Thermal_Init();
+
   /* Общее реле питания. */
   IO_RelayOn(RELAY_POWER);
 
@@ -76,7 +81,7 @@ int main(void)
   {
     CanBus_CheckTimeout();        /* потеря связи -> управляемый останов     */
     Cooling_CheckOvercurrent();   /* пик / перегрузка / обрыв нагрузки       */
-    Cooling_CheckTemperature();   /* перегрев платы -> останов до остывания  */
+    Thermal_Update();             /* перегрев платы -> останов до остывания  */
     Cooling_Update();             /* разгон, выбег, стекание индукции, EN    */
   }
 }
