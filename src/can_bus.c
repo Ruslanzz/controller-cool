@@ -113,10 +113,10 @@ void CanBus_TxTask(void)
  *
  *   0x5A1 — сводка каналов:
  *     [0] вентилятор 1: биты 0-2 состояние (FanState), биты 3-5 авария
- *         (FanFault), бит 6 — EN драйвера поднят, бит 7 — ноль датчика тока
- *         откалиброван;
+ *         (FanFault), бит 6 — обмотка подключена (нижнее плечо открыто),
+ *         бит 7 — ноль датчика тока откалиброван;
  *     [1] вентилятор 1: скважность, %;
- *     [2..3] вентилятор 1: средний ток, отсчёты АЦП от нуля датчика (LE16);
+ *     [2..3] вентилятор 1: средний ток обмотки, мА (LE16);
  *     [4..7] — то же для вентилятора 2.
  *
  *   0x5A2 — сырые каналы АЦП: ток DRV1, ток DRV2, температура 1,
@@ -124,6 +124,12 @@ void CanBus_TxTask(void)
  *
  *   0x5A3 — нули датчиков тока (LE16), счётчики срабатываний защиты и
  *     повторных пусков по каналам.
+ *
+ *   0x5A5 — судьба защиты по току: действующий пиковый порог каналов 1 и 2
+ *     (мА, LE16; 0 означает «защита канала ОТКЛЮЧЕНА»), потолок измерения
+ *     каналов 1 и 2 (мА, LE16). Кадр нужен потому, что незащищённый канал
+ *     иначе выглядит точно так же, как защищённый: защита отключает себя,
+ *     если ноль датчика неправдоподобен или порог не помещается под потолок.
  *
  *   0x5A4 — тепловая защита и ограничитель частоты пусков:
  *     [0] флаги: бит 0 — тепловое отключение активно; биты 1/2 — датчик
@@ -135,7 +141,8 @@ void CanBus_TxTask(void)
  *     [4]/[5] — оценка оборотов выбегающей крыльчатки канала 1/2, % от
  *         рабочей точки (0 — крыльчатка стоит).
  *
- * Пересчёт тока в амперы: I = (значение) / ACS724_ADC_PER_AMP.
+ * Ток отдаётся в миллиамперах: масштаб датчика выводится из измеренного нуля
+ * (см. config.h), поэтому пересчитывать на стороне приёмника ничего не нужно.
  * -------------------------------------------------------------------------- */
 static void CanBus_SendDebugFrame(void)
 {
@@ -149,14 +156,14 @@ static void CanBus_SendDebugFrame(void)
   switch (dbg_sel) {
     case 0: {
       uint8_t s1 = (uint8_t)((f1.state & 0x07) | ((f1.fault & 0x07) << 3) |
-                             (f1.enabled ? 0x40 : 0) | (f1.zero_valid ? 0x80 : 0));
+                             (f1.connected ? 0x40 : 0) | (f1.zero_valid ? 0x80 : 0));
       uint8_t s2 = (uint8_t)((f2.state & 0x07) | ((f2.fault & 0x07) << 3) |
-                             (f2.enabled ? 0x40 : 0) | (f2.zero_valid ? 0x80 : 0));
+                             (f2.connected ? 0x40 : 0) | (f2.zero_valid ? 0x80 : 0));
       uint8_t data_fan[8] = {
         s1, (uint8_t)f1.duty_pct,
-        (uint8_t)(f1.i_avg_adc & 0xFF), (uint8_t)(f1.i_avg_adc >> 8),
+        (uint8_t)(f1.ma_avg & 0xFF), (uint8_t)(f1.ma_avg >> 8),
         s2, (uint8_t)f2.duty_pct,
-        (uint8_t)(f2.i_avg_adc & 0xFF), (uint8_t)(f2.i_avg_adc >> 8)
+        (uint8_t)(f2.ma_avg & 0xFF), (uint8_t)(f2.ma_avg >> 8)
       };
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 1), data_fan, 8);
       break;
@@ -186,7 +193,7 @@ static void CanBus_SendDebugFrame(void)
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 3), data_cal, 8);
       break;
     }
-    default: {
+    case 3: {
       CoolingStatus cs = {0};
       Cooling_GetGlobalStatus(&cs);
 
@@ -208,9 +215,21 @@ static void CanBus_SendDebugFrame(void)
       CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 4), data_th, 6);
       break;
     }
+    default: {
+      /* Судьба защиты по току: порог 0 означает, что защита канала отключена
+       * (недостоверный ноль датчика или порог выше потолка измерения).      */
+      uint8_t data_oc[8] = {
+        (uint8_t)(f1.oc_peak_ma & 0xFF), (uint8_t)(f1.oc_peak_ma >> 8),
+        (uint8_t)(f2.oc_peak_ma & 0xFF), (uint8_t)(f2.oc_peak_ma >> 8),
+        (uint8_t)(f1.ceiling_ma & 0xFF), (uint8_t)(f1.ceiling_ma >> 8),
+        (uint8_t)(f2.ceiling_ma & 0xFF), (uint8_t)(f2.ceiling_ma >> 8)
+      };
+      CanBus_SendStd(CanBus_GenerateStdId(device_id, BASE_DEBUG, 5), data_oc, 8);
+      break;
+    }
   }
 
-  dbg_sel = (uint8_t)((dbg_sel + 1) % 4);
+  dbg_sel = (uint8_t)((dbg_sel + 1) % 5);
 }
 
 /* --------------------------------------------------------------------------
