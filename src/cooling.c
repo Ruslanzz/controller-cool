@@ -4,22 +4,30 @@
   * @brief   Реализация управления вентиляторами радиатора (L1 = DRV1, L2 = DRV2).
   *
   *          Полярность моста — как у балки на controller-front и у катушек на
-  *          ведущем: IN_A (регулируемое плечо) со сравнением PWM_PERIOD даёт
-  *          нулевой ток, 0 — полный; IN_B держится открытым (PWM_PERIOD).
+  *          ведущем: IN_A (регулируемое плечо, верхний P-канальный ключ) со
+  *          сравнением PWM_PERIOD даёт нулевой ток, 0 — полный; IN_B (нижний
+  *          N-канальный) при работе держится открытым (PWM_PERIOD).
   *
   *          Из этого следует ключевое для индуктивной нагрузки свойство: в
-  *          паузе ШИМ оба плеча подняты и обмотка замкнута сама на себя через
-  *          верхние ключи. Ток якоря циркулирует по этому контуру, а не рвётся.
-  *          Поэтому «скважность 0 при поднятом EN» — не выключение, а режим
-  *          выбега, в котором индуктивность стекает без выброса напряжения.
-  *          Мост обесточивается снятием EN только после FAN_DECAY_MS в этом
-  *          режиме.
+  *          паузе ШИМ ток якоря замыкается по контуру
+  *          GND -> VD32/33/34 -> обмотка -> датчик -> нижний ключ -> GND и
+  *          не рвётся. Поэтому «скважность 0 при открытом нижнем плече» — не
+  *          выключение, а режим гашения. Обмотка размыкается закрытием
+  *          НИЖНЕГО плеча после FAN_DECAY_MS в этом режиме.
+  *
+  *          EN обоих драйверов поднимается один раз в Cooling_EnableDrivers и
+  *          больше не трогается: снятие EN открывает верхний ключ ПОЛНОСТЬЮ,
+  *          то есть включает вентилятор на полный ход (DRV_OUTPUT_STAGE.md).
+  *          Прежняя версия этого модуля снимала EN в OFF и FAULT — то есть
+  *          «останов» и срабатывание защиты давали полные обороты. Здесь
+  *          «выключено» всегда означает положение ПЛЕЧ, а не состояние EN.
   ******************************************************************************
   */
 
 #include "cooling.h"
 #include "config.h"
 #include "bsp.h"
+#include "thermal.h"
 
 /* Скважность хранится в сотых долях процента: шаг разгона получается плавным
  * без накопления ошибки целочисленного деления.                             */
@@ -29,8 +37,8 @@
 
 /* ===== Неизменная привязка канала к железу ================================ */
 typedef struct {
-  uint32_t      ch_a;      /* канал TIM4: регулируемое плечо IN_A            */
-  uint32_t      ch_b;      /* канал TIM4: постоянно открытое плечо IN_B      */
+  uint32_t      ch_a;      /* канал TIM4: регулируемое плечо IN_A (верхнее)  */
+  uint32_t      ch_b;      /* канал TIM4: нижнее плечо IN_B                  */
   GPIO_TypeDef *en_port;   /* порт линий разрешения драйвера                 */
   uint16_t      en_a_pin;
   uint16_t      en_b_pin;
@@ -48,7 +56,7 @@ static const FanHw fan_hw[FAN_COUNT] = {
 typedef struct {
   FanState state;
   FanFault fault;
-  uint8_t  enabled;      /* EN драйвера поднят                              */
+  uint8_t  connected;    /* нижнее плечо открыто: обмотка подключена к мосту */
 
   uint32_t duty_q;       /* текущая скважность, сотые доли процента         */
   uint32_t ramp_from_q;  /* скважность на начало текущей рампы              */
@@ -60,8 +68,14 @@ typedef struct {
 
   uint32_t zero_adc;     /* ноль датчика тока (измеренный или номинальный)  */
   uint8_t  zero_valid;
+  uint32_t ceiling_ma;   /* потолок измерения при этом нуле, мА             */
+  uint32_t oc_peak_ma;   /* действующий пиковый порог, мА                   */
+  uint8_t  oc_enabled;   /* 0 — защита канала отключена (нет доверия/запаса)*/
+  uint8_t  saturated;    /* показание упирается в потолок АЦП               */
   uint32_t i_acc;        /* аккумулятор ЭФ среднего тока (масштаб 2^SHIFT)  */
-  uint32_t oc_peak_acc;  /* «дырявое ведро» пиковой защиты                  */
+  uint32_t oc_hits[FAN_OC_WINDOW_HITS];  /* окно превышений пикового порога */
+  uint8_t  oc_head;
+  uint8_t  oc_count;
   uint32_t ovl_since;    /* начало непрерывной перегрузки, 0 — нет          */
   uint32_t open_since;   /* начало отсутствия тока под нагрузкой, 0 — нет   */
 
@@ -93,14 +107,6 @@ static uint8_t           cmd_stable       = 0;
 static uint8_t           cmd_effective    = 0;
 static uint32_t          cmd_effective_tick = 0;
 
-/* --- Тепловая защита платы ----------------------------------------------- */
-static uint8_t  thermal_shutdown = 0;
-static uint8_t  temp_valid[2]    = {0, 0};
-static uint8_t  temp_over[2]     = {0, 0};
-static uint32_t temp_over_since[2] = {0, 0};
-
-static const uint8_t temp_idx[2] = { TEMP_SENS_1_IDX, TEMP_SENS_2_IDX };
-
 /* --- Запрет пуска сразу после сброса МК -----------------------------------
  * Если МК перезагрузился на ходу (просадка питания, watchdog, перепрошивка),
  * EN снялись — и крыльчатка осталась вращаться, а её обороты после сброса
@@ -119,11 +125,22 @@ static const uint8_t temp_idx[2] = { TEMP_SENS_1_IDX, TEMP_SENS_2_IDX };
 static uint32_t boot_tick = 0;
 
 /* ==========================================================================
- * Низкий уровень: мост и разрешение драйвера.
+ * Низкий уровень: положение плеч.
+ *
+ * EN здесь не фигурирует вообще, и это главное отличие от прежней версии:
+ * снятие EN открывает верхний ключ ПОЛНОСТЬЮ (DRV_OUTPUT_STAGE.md), поэтому
+ * управлять им нельзя — он поднимается один раз в Cooling_EnableDrivers.
+ * Всё управление — это положение плеч:
+ *
+ *   работа:    нижнее открыто, верхнее по скважности   (Fan_ApplyDuty)
+ *   гашение:   нижнее открыто, верхнее закрыто          (Fan_ApplyDuty, duty 0)
+ *   разомкнуто: оба закрыты, выход высокоомный          (Fan_Disconnect)
  * ========================================================================== */
 
-/* Выставить скважность на регулируемом плече. Плечо IN_B держится открытым,
- * поэтому duty_q = 0 -> оба плеча подняты -> контур циркуляции замкнут.
+/* Выставить скважность на регулируемом плече и открыть нижнее: обмотка
+ * подключена к мосту. duty_q = 0 -> верхнее плечо закрыто, нижнее открыто,
+ * то есть контур гашения замкнут (ток якоря идёт GND -> VD32/33/34 ->
+ * обмотка -> датчик -> нижний ключ -> GND).
  *
  * Слишком короткие импульсы не выдаются вовсе. В начале разгона расчётная
  * длительность падает до единиц наносекунд — драйвер за такое время не успеет
@@ -142,20 +159,43 @@ static void Fan_ApplyDuty(uint8_t i)
 
   __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_b, PWM_PERIOD);
   __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_a, PWM_PERIOD - on);
+  fan[i].connected = 1;
 }
 
-static void Fan_EnableDriver(uint8_t i)
+/* Разомкнуть обмотку: ОБА плеча закрыты, выход в высокоомном состоянии.
+ * Это и есть настоящее «выключено» на данном каскаде — то, что прежде
+ * пытались получить снятием EN. Крыльчатка после этого выбегает свободно:
+ * ЭДС генератора ниже питания, банки обратных диодов закрыты, тока нет.
+ *
+ * Вызывать только после выдержки гашения (FAN_DECAY_MS) при нулевой
+ * скважности: размыкать обмотку с током значило бы оборвать индуктивность.  */
+static void Fan_Disconnect(uint8_t i)
 {
-  HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_a_pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_b_pin, GPIO_PIN_SET);
-  fan[i].enabled = 1;
+  __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_a, PWM_PERIOD);  /* верхнее закр. */
+  __HAL_TIM_SET_COMPARE(&htim4, fan_hw[i].ch_b, 0);           /* нижнее закр.  */
+  fan[i].connected = 0;
 }
 
-static void Fan_DisableDriver(uint8_t i)
+void Cooling_EnableDrivers(void)
 {
-  HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_a_pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_b_pin, GPIO_PIN_RESET);
-  fan[i].enabled = 0;
+  /* РОВНО ОДИН РАЗ за всё время работы прошивки, ПОСЛЕ Cooling_Init и запуска
+   * ШИМ. Обратной операции в этом модуле нет вообще: снятие EN открывает
+   * верхний P-канальный ключ полностью и обесценивает записи в регистры
+   * сравнения.                                                              */
+  for (uint8_t i = 0; i < FAN_COUNT; i++) {
+    HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_a_pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(fan_hw[i].en_port, fan_hw[i].en_b_pin, GPIO_PIN_SET);
+  }
+}
+
+/* Отсчёты АЦП от нуля датчика -> миллиамперы. Масштаб выводится из
+ * ИЗМЕРЕННОГО нуля (датчик ратиометричный) — вывод в config.h.              */
+static uint32_t Fan_AdcToMa(uint8_t i, uint32_t adc_delta)
+{
+  if (fan[i].zero_adc == 0) {
+    return 0;
+  }
+  return (adc_delta * (uint32_t)FAN_ADC_FULL_SCALE_MA) / fan[i].zero_adc;
 }
 
 /* ==========================================================================
@@ -206,16 +246,23 @@ static uint8_t Fan_StepRamp(uint8_t i, uint32_t now)
 
 static void Fan_ResetProtection(uint8_t i)
 {
-  fan[i].i_acc       = 0;
-  fan[i].oc_peak_acc = 0;
-  fan[i].ovl_since   = 0;
-  fan[i].open_since  = 0;
+  fan[i].i_acc      = 0;
+  fan[i].oc_head    = 0;
+  fan[i].oc_count   = 0;
+  fan[i].ovl_since  = 0;
+  fan[i].open_since = 0;
 }
 
-/* Средний ток канала в отсчётах АЦП (модуль отклонения от нуля датчика). */
+/* Средний ток канала в отсчётах АЦП (положительное отклонение от нуля). */
 static uint32_t Fan_AvgCurrent(uint8_t i)
 {
   return fan[i].i_acc >> FAN_I_AVG_SHIFT;
+}
+
+/* Средний ток канала в миллиамперах. */
+static uint32_t Fan_AvgCurrentMa(uint8_t i)
+{
+  return Fan_AdcToMa(i, Fan_AvgCurrent(i));
 }
 
 static void Fan_EnterState(uint8_t i, FanState state, uint32_t now)
@@ -350,11 +397,14 @@ static uint8_t Fan_BeginStart(uint8_t i, uint32_t now)
 
 /* Аварийное отключение канала.
  *
- * Скважность обнуляется НЕМЕДЛЕННО, но EN остаётся поднятым: мост переходит в
- * ту же циркуляцию, что и в любой паузе ШИМ, и ток якоря стекает по обмотке.
- * Снятие EN выполняет автомат по истечении FAN_DECAY_MS. Рвать контур тока
- * прямо в момент аварии нельзя — выброс индуктивности пришёлся бы на ключи,
- * которые и так работают на пределе.                                        */
+ * Скважность обнуляется НЕМЕДЛЕННО, но нижнее плечо остаётся открытым: мост
+ * переходит в то же гашение, что и в любой паузе ШИМ, и ток якоря замыкается
+ * в контур гашения. Размыкание обмотки выполняет автомат по истечении
+ * FAN_DECAY_MS. Рвать контур тока прямо в момент аварии нельзя — выброс
+ * индуктивности пришёлся бы на ключи, которые и так работают на пределе.
+ *
+ * EN при этом не трогается: его снятие открыло бы верхний ключ полностью, то
+ * есть защита включила бы вентилятор на полный ход вместо отключения.       */
 static void Fan_Trip(uint8_t i, FanFault fault, uint32_t now)
 {
   /* Крыльчатку никто не тормозил — она продолжает вращаться на оборотах,
@@ -385,8 +435,12 @@ void Cooling_Init(void)
     fan[i].state      = FAN_STATE_OFF;
     fan[i].fault      = FAN_FAULT_NONE;
     fan[i].duty_q     = 0;
-    fan[i].zero_adc   = ACS724_ZERO_ADC;
+    fan[i].zero_adc   = FAN_ZERO_NOMINAL_ADC;
     fan[i].zero_valid = 0;
+    fan[i].ceiling_ma = 0;
+    fan[i].oc_peak_ma = FAN_OC_PEAK_MA;
+    fan[i].oc_enabled = 0;
+    fan[i].saturated  = 0;
     fan[i].retries    = 0;
     fan[i].trips      = 0;
     fan[i].state_tick = HAL_GetTick();
@@ -400,9 +454,10 @@ void Cooling_Init(void)
 
     Fan_ResetProtection(i);
 
-    /* Сначала безопасное положение плеч, только потом (в автомате) EN. */
-    Fan_ApplyDuty(i);
-    Fan_DisableDriver(i);
+    /* Безопасное положение плеч ДО запуска ШИМ и до подачи EN: оба плеча
+     * закрыты, выход высокоомный. Ноль на верхнем плече (значение сравнения
+     * по умолчанию) означал бы вентилятор на полном ходу.                   */
+    Fan_Disconnect(i);
   }
 }
 
@@ -410,7 +465,10 @@ void Cooling_CalibrateCurrentSensors(void)
 {
   uint32_t sum[FAN_COUNT] = {0};
 
-  /* АЦП уже крутится по DMA; дать буферу заполниться и усреднить. */
+  /* АЦП уже крутится по DMA; дать буферу заполниться и усреднить. Оба плеча в
+   * этот момент закрыты при уже поднятом EN — тока через датчики нет, они
+   * показывают собственный ноль. Ждать «пока мосты обесточены» здесь нельзя:
+   * снятый EN означает открытый верхний ключ, то есть работающий вентилятор. */
   HAL_Delay(50);
   for (uint8_t s = 0; s < ACS_CAL_SAMPLES; s++) {
     for (uint8_t i = 0; i < FAN_COUNT; i++) {
@@ -426,12 +484,27 @@ void Cooling_CalibrateCurrentSensors(void)
       fan[i].zero_adc   = zero;
       fan[i].zero_valid = 1;
     } else {
-      /* Датчик неисправен или не подключён. Защиту не отключаем — вентилятор
-       * без защиты по току не оставляем; берём номинальный ноль и поднимаем
-       * признак в телеметрию.                                              */
-      fan[i].zero_adc   = ACS724_ZERO_ADC;
+      /* Датчик неисправен или не подключён: берём номинальный ноль и
+       * ОТКЛЮЧАЕМ защиту канала. Прежде здесь защита оставалась в работе с
+       * номинальным нулём — но при неисправном датчике она работает наоборот:
+       * показание около нуля читается как отсутствие тока, и контроль обрыва
+       * нагрузки сам останавливает исправный вентилятор (см. config.h).     */
+      fan[i].zero_adc   = FAN_ZERO_NOMINAL_ADC;
       fan[i].zero_valid = 0;
     }
+
+    /* Потолок измерения: выше 4095 отсчётов АЦП не видит ничего. Если пиковый
+     * порог не помещается под него с запасом, защита канала честно
+     * отключается — мёртвый порог хуже честно выключенного, он создаёт ложное
+     * ощущение защиты (факт виден в телеметрии).                            */
+    fan[i].ceiling_ma = (fan[i].zero_adc < 4095u)
+                          ? Fan_AdcToMa(i, 4095u - fan[i].zero_adc) : 0u;
+
+    fan[i].oc_peak_ma = FAN_OC_PEAK_MA;
+    fan[i].oc_enabled = (uint8_t)(fan[i].zero_valid &&
+                                  fan[i].ceiling_ma >=
+                                    ((uint32_t)FAN_OC_PEAK_MA +
+                                     (uint32_t)FAN_OC_MIN_HEADROOM_MA));
   }
 }
 
@@ -463,7 +536,7 @@ static void Cooling_UpdateCommand(uint32_t now)
   /* Эффективная команда: устойчивая и не снятая тепловой защитой. Фронт её
    * включения — точка отсчёта разноса пусков; поэтому после снятия перегрева
    * вентиляторы снова стартуют вразнобой, а не оба разом.                  */
-  uint8_t eff = (uint8_t)(cmd_stable && !thermal_shutdown);
+  uint8_t eff = (uint8_t)(cmd_stable && !Thermal_Limit());
   if (eff && !cmd_effective) {
     cmd_effective_tick = now;
   }
@@ -484,67 +557,6 @@ static uint8_t Fan_Command(uint8_t i, uint32_t now)
   return ((now - cmd_effective_tick) >= FAN_STAGGER_MS) ? 1 : 0;
 }
 
-/* ==========================================================================
- * Тепловая защита платы.
- *
- * Датчики меряют плату, которую греют сами ключи мостов, поэтому останов
- * вентиляторов действительно снижает температуру — снимается рассеиваемая
- * мощность. Перегрев любого ИСПРАВНОГО датчика останавливает оба канала:
- * припой, электролиты и МК — общие для платы, а два остановленных канала
- * остывают быстрее одного.
- * ========================================================================== */
-
-void Cooling_CheckTemperature(void)
-{
-  static uint32_t sample_tick = 0;
-
-  uint32_t now = HAL_GetTick();
-
-  if ((now - sample_tick) < TEMP_SAMPLE_MS) {
-    return;
-  }
-  sample_tick = now;
-
-  uint8_t any_over = 0;
-
-  for (uint8_t s = 0; s < 2; s++) {
-    uint32_t adc = ADS_RES_BUFFER[temp_idx[s]];
-
-    /* Оборванный (отсчёт у потолка) или закороченный (у нуля) датчик.
-     * По такому показанию НЕ отключаем: остановленное охлаждение опаснее
-     * неизвестной температуры. Второй датчик продолжает защищать.          */
-    if (adc < TEMP_VALID_MIN_ADC || adc > TEMP_VALID_MAX_ADC) {
-      temp_valid[s]      = 0;
-      temp_over[s]       = 0;
-      temp_over_since[s] = 0;
-      continue;
-    }
-    temp_valid[s] = 1;
-
-    if (TEMP_HOTTER(adc, TEMP_TRIP_ADC)) {
-      /* Выше порога отключения — с выдержкой, чтобы одиночная выборка не
-       * останавливала охлаждение.                                          */
-      if (temp_over_since[s] == 0) {
-        temp_over_since[s] = (now != 0) ? now : 1;
-      } else if ((now - temp_over_since[s]) >= TEMP_TRIP_MS) {
-        temp_over[s] = 1;
-      }
-    } else if (!TEMP_HOTTER(adc, TEMP_CLEAR_ADC)) {
-      /* Ниже порога возврата — перегрев снят. */
-      temp_over[s]       = 0;
-      temp_over_since[s] = 0;
-    } else {
-      /* Между порогами: держим текущее состояние (гистерезис 20 °C). */
-      temp_over_since[s] = 0;
-    }
-
-    if (temp_over[s]) {
-      any_over = 1;
-    }
-  }
-
-  thermal_shutdown = any_over;
-}
 
 /* ==========================================================================
  * Автомат канала.
@@ -559,22 +571,27 @@ static void Fan_Step(uint8_t i, uint32_t now)
   switch (fan[i].state) {
 
     case FAN_STATE_OFF:
-      /* Мост обесточен. Пуск — только после FAN_MIN_OFF_MS: за эту паузу
-       * разряжаются бутстрепные ёмкости верхних ключей и затворные цепи
-       * приходят в определённое состояние. Пуск на недозаряженном бутстрепе
-       * держит верхний ключ в линейном режиме — это его и пробивает.       */
+      /* Обмотка разомкнута (оба плеча закрыты). Страховка на случай прихода
+       * сюда из FAULT до истечения выдержки гашения: размыкаем, выдержав ту
+       * же паузу, чтобы не рвать обмотку с током.                          */
+      if (fan[i].connected && (now - fan[i].state_tick) >= FAN_DECAY_MS) {
+        Fan_Disconnect(i);
+      }
+
+      /* Пуск — только после FAN_MIN_OFF_MS: пауза ограничивает темп пусков и
+       * гарантирует, что любой переходный процесс в обмотке закончился.    */
       if (cmd && (now - fan[i].state_tick) >= FAN_MIN_OFF_MS &&
           (now - boot_tick) >= FAN_COAST_MS &&
           Fan_StartAllowed(i, now)) {
         /* Крыльчатка может ещё выбегать (после аварии — до 20 с). Скважность
-         * моста подводится к её текущим оборотам ДО подачи EN: при нулевой
-         * скважности оба плеча подняты, то есть обмотка замкнута накоротко, и
-         * EN на вращающемся генераторе дал бы ток ЭДС/Ra в десятки ампер.   */
+         * подводится к её текущим оборотам ТЕМ ЖЕ действием, которым обмотка
+         * подключается к мосту: подключить её на нулевой скважности значит
+         * замкнуть вращающийся генератор на контур гашения и получить ток
+         * ЭДС/Ra в десятки ампер.                                          */
         fan[i].duty_q = Fan_CoastDuty(i, now);
         Fan_ApplyDuty(i);
         fan[i].coast_q = 0;
 
-        Fan_EnableDriver(i);
         Fan_ResetProtection(i);
         Fan_StartRamp(i, DUTY_TARGET_Q, FAN_RAMP_UP_MS, now);
         Fan_EnterState(i, FAN_STATE_STARTING, now);
@@ -605,8 +622,8 @@ static void Fan_Step(uint8_t i, uint32_t now)
 
     case FAN_STATE_STOPPING:
       /* Команду вернули посреди выбега — плавно уходим обратно в разгон,
-       * EN снимать не начинали. Если ограничитель частоты пусков не пустил,
-       * останов продолжается: бросать канал на полпути нельзя.             */
+       * обмотку размыкать не начинали. Если ограничитель частоты пусков не
+       * пустил, останов продолжается: бросать канал на полпути нельзя.     */
       if (cmd && Fan_BeginStart(i, now)) {
         break;
       }
@@ -622,38 +639,44 @@ static void Fan_Step(uint8_t i, uint32_t now)
       break;
 
     case FAN_STATE_DECAY:
-      /* Скважность 0, EN ещё поднят: обмотка замкнута через верхние ключи —
-       * ток якоря коммутируется в этот контур без выброса напряжения.
+      /* Скважность 0, нижнее плечо ещё открыто: ток якоря замкнут в контур
+       * гашения GND -> VD32/33/34 -> обмотка -> датчик -> нижний ключ -> GND
+       * и коммутируется в него без выброса напряжения.
        *
        * Это состояние КОРОТКОЕ и намеренно: замкнутая обмотка вращающегося
        * двигателя — не «стекание», а динамическое торможение, ток в ней не
        * спадает, а устанавливается на ЭДС/Ra. Держать замыкание дольше
        * необходимого значит греть ключи кинетической энергией крыльчатки.  */
-      fan[i].duty_q = 0;
-      Fan_ApplyDuty(i);
+      if (fan[i].connected) {
+        fan[i].duty_q = 0;
+        Fan_ApplyDuty(i);
+      }
 
-      /* Мост под разрешением — повторный пуск можно начать сразу, бутстреп
-       * не разряжался. Но пуск всё равно проходит через ограничитель
-       * частоты: именно дребезг команды и создаёт цикл «стоп-пуск».        */
+      /* Обмотка ещё подключена — повторный пуск можно начать сразу. Но он
+       * всё равно проходит через ограничитель частоты: именно дребезг
+       * команды и создаёт цикл «стоп-пуск».                                */
       if (cmd && Fan_BeginStart(i, now)) {
         break;
       }
       if ((now - fan[i].state_tick) >= FAN_DECAY_MS) {
-        /* Ток якоря скоммутирован — размыкаем. Дальше обмотка разомкнута:
-         * ЭДС генератора ниже питания, паразитные диоды ключей закрыты,
-         * тока нет, и крыльчатка выбегает СВОБОДНО (10..20 с).            */
-        Fan_DisableDriver(i);
+        /* Ток якоря скоммутирован — размыкаем обмотку закрытием нижнего
+         * плеча. Дальше выход высокоомный: ЭДС генератора ниже питания,
+         * банки обратных диодов закрыты, тока нет, и крыльчатка выбегает
+         * СВОБОДНО (10..20 с).                                             */
+        Fan_Disconnect(i);
         Fan_EnterState(i, FAN_STATE_OFF, now);
       }
       break;
 
     case FAN_STATE_FAULT:
-      /* Скважность обнулена ещё в Fan_Trip; ждём стекания и снимаем EN. */
-      fan[i].duty_q = 0;
-      Fan_ApplyDuty(i);
+      /* Скважность обнулена ещё в Fan_Trip; ждём гашения и размыкаем. */
+      if (fan[i].connected) {
+        fan[i].duty_q = 0;
+        Fan_ApplyDuty(i);
 
-      if (fan[i].enabled && (now - fan[i].state_tick) >= FAN_DECAY_MS) {
-        Fan_DisableDriver(i);
+        if ((now - fan[i].state_tick) >= FAN_DECAY_MS) {
+          Fan_Disconnect(i);
+        }
       }
 
       if (!cmd) {
@@ -695,21 +718,42 @@ void Cooling_Update(void)
 /* ==========================================================================
  * Защита по току.
  *
- * АЦП обходит 8 каналов примерно за 224 мкс и не синхронизирован с ШИМ
- * 16 кГц, поэтому отдельная выборка случайно попадает либо на такт
- * проводимости, либо на паузу. Отсюда две независимые ветви:
- *   - пиковая — «дырявое ведро» по мгновенным выборкам (ловит короткое
- *     замыкание и клин ротора за единицы миллисекунд, не реагируя на
- *     одиночные выбросы АЦП);
+ * АЦП обходит 8 каналов примерно за 224 мкс и не синхронизирован с ШИМ,
+ * поэтому отдельные выборки садятся в случайные точки пульсации тока. Отсюда
+ * две независимые ветви:
+ *   - пиковая — счёт превышений в окне (ловит короткое замыкание и клин
+ *     ротора за единицы миллисекунд, не реагируя на одиночные выбросы АЦП);
  *   - средняя — экспоненциальный фильтр (ловит длительную перегрузку и
  *     обрыв нагрузки, не реагируя на разрывность выборок).
+ *
+ * Обе работают в МИЛЛИАМПЕРАХ и только по ПОЛОЖИТЕЛЬНОМУ отклонению от нуля:
+ * ток однонаправленный, поэтому отрицательное отклонение означает не переток,
+ * а неисправность измерения (обоснование — в config.h).
  * ========================================================================== */
+
+/* Зарегистрировать превышение пикового порога и проверить, набралось ли их
+ * достаточно в окне. Кольцо из FAN_OC_WINDOW_HITS отметок: после записи новой
+ * oc_head указывает на САМУЮ СТАРУЮ, поэтому условие срабатывания — «кольцо
+ * заполнено и самая старая отметка не старше FAN_OC_WINDOW_MS».             */
+static uint8_t Fan_RegisterOverCurrent(uint8_t i, uint32_t now)
+{
+  fan[i].oc_hits[fan[i].oc_head] = now;
+  fan[i].oc_head = (uint8_t)((fan[i].oc_head + 1) % FAN_OC_WINDOW_HITS);
+  if (fan[i].oc_count < FAN_OC_WINDOW_HITS) {
+    fan[i].oc_count++;
+  }
+
+  if (fan[i].oc_count < FAN_OC_WINDOW_HITS) {
+    return 0;
+  }
+  return ((now - fan[i].oc_hits[fan[i].oc_head]) <= FAN_OC_WINDOW_MS) ? 1 : 0;
+}
 
 static void Fan_CheckCurrent(uint8_t i, uint32_t now)
 {
   /* Ток контролируем только пока мост реально питает обмотку. В DECAY и
-   * FAULT скважность нулевая, в OFF мост обесточен — накопители сбрасываем,
-   * чтобы следующий пуск начинался с чистого состояния.                     */
+   * FAULT скважность нулевая, в OFF обмотка разомкнута — накопители
+   * сбрасываем, чтобы следующий пуск начинался с чистого состояния.         */
   if (fan[i].state != FAN_STATE_STARTING &&
       fan[i].state != FAN_STATE_RUNNING  &&
       fan[i].state != FAN_STATE_STOPPING) {
@@ -717,31 +761,38 @@ static void Fan_CheckCurrent(uint8_t i, uint32_t now)
     return;
   }
 
-  int32_t  raw   = (int32_t)ADS_RES_BUFFER[fan_hw[i].adc_idx];
-  int32_t  diff  = raw - (int32_t)fan[i].zero_adc;
-  uint32_t delta = (uint32_t)((diff < 0) ? -diff : diff);
+  uint32_t raw_u = ADS_RES_BUFFER[fan_hw[i].adc_idx];
+  int32_t  diff  = (int32_t)raw_u - (int32_t)fan[i].zero_adc;
+  uint32_t delta = (diff > 0) ? (uint32_t)diff : 0u;
 
-  /* --- Пиковая защита: короткое замыкание / заклиненный ротор. --- */
-  if (delta > FAN_OC_PEAK_ADC) {
-    fan[i].oc_peak_acc += FAN_OC_PEAK_INC;
-    if (fan[i].oc_peak_acc >= FAN_OC_PEAK_LIMIT) {
-      Fan_Trip(i, FAN_FAULT_PEAK, now);
-      return;
-    }
-  } else if (fan[i].oc_peak_acc > 0) {
-    fan[i].oc_peak_acc--;
+  /* Показание упёрлось в потолок АЦП: истинный ток больше измеренного. */
+  fan[i].saturated = (uint8_t)(raw_u >= 4090u);
+
+  /* Датчику нельзя верить — ни одна из ветвей работать не должна: на
+   * недостоверном показании «перегрузка» и «обрыв нагрузки» одинаково
+   * означали бы останов исправного вентилятора (см. config.h).             */
+  if (!fan[i].oc_enabled) {
+    Fan_ResetProtection(i);
+    return;
   }
 
-  /* --- Средний ток: экспоненциальный фильтр по модулю отклонения.
+  /* --- Пиковая защита: короткое замыкание / заклиненный ротор. --- */
+  if (Fan_AdcToMa(i, delta) > fan[i].oc_peak_ma &&
+      Fan_RegisterOverCurrent(i, now)) {
+    Fan_Trip(i, FAN_FAULT_PEAK, now);
+    return;
+  }
+
+  /* --- Средний ток: экспоненциальный фильтр по положительному отклонению.
    * Аккумулятор хранится домноженным на 2^FAN_I_AVG_SHIFT — иначе выборки
    * меньше 2^SHIFT отсчётов терялись бы при сдвиге и фильтр «слепнул» бы на
    * малых токах, ровно там, где работает контроль обрыва нагрузки.
    * Максимум аккумулятора 4095 << 6 = 262080 — в uint32 помещается.        */
   fan[i].i_acc = fan[i].i_acc - Fan_AvgCurrent(i) + delta;
-  uint32_t i_avg = Fan_AvgCurrent(i);
+  uint32_t i_avg_ma = Fan_AvgCurrentMa(i);
 
   /* --- Длительная перегрузка. --- */
-  if (i_avg > FAN_OC_AVG_ADC) {
+  if (i_avg_ma > FAN_OC_AVG_MA) {
     if (fan[i].ovl_since == 0) {
       fan[i].ovl_since = (now != 0) ? now : 1;
     } else if ((now - fan[i].ovl_since) >= FAN_OC_AVG_TRIP_MS) {
@@ -755,7 +806,7 @@ static void Fan_CheckCurrent(uint8_t i, uint32_t now)
   /* --- Обрыв нагрузки: проверяем только на установившейся рабочей
    * скважности, где ток заведомо должен быть. В разгоне и выбеге низкий
    * средний ток нормален.                                                   */
-  if (fan[i].state == FAN_STATE_RUNNING && i_avg < FAN_OPEN_LOAD_ADC) {
+  if (fan[i].state == FAN_STATE_RUNNING && i_avg_ma < FAN_OPEN_LOAD_MA) {
     if (fan[i].open_since == 0) {
       fan[i].open_since = (now != 0) ? now : 1;
     } else if ((now - fan[i].open_since) >= FAN_OPEN_LOAD_MS) {
@@ -799,11 +850,19 @@ void Cooling_GetStatus(uint8_t fan_index, FanStatus *out)
   out->fault      = fan[fan_index].fault;
   out->duty_pct   = (uint16_t)(fan[fan_index].duty_q / DUTY_SCALE);
   out->i_avg_adc  = (uint16_t)Fan_AvgCurrent(fan_index);
+  out->ma_avg     = (uint16_t)((Fan_AvgCurrentMa(fan_index) > 0xFFFFu)
+                               ? 0xFFFFu : Fan_AvgCurrentMa(fan_index));
   out->zero_adc   = (uint16_t)fan[fan_index].zero_adc;
+  out->ceiling_ma = (uint16_t)((fan[fan_index].ceiling_ma > 0xFFFFu)
+                               ? 0xFFFFu : fan[fan_index].ceiling_ma);
+  out->oc_peak_ma = (uint16_t)(fan[fan_index].oc_enabled
+                               ? fan[fan_index].oc_peak_ma : 0u);
+  out->oc_enabled  = fan[fan_index].oc_enabled;
+  out->saturated   = fan[fan_index].saturated;
   out->zero_valid  = fan[fan_index].zero_valid;
   out->retries     = fan[fan_index].retries;
   out->trips       = fan[fan_index].trips;
-  out->enabled     = fan[fan_index].enabled;
+  out->connected   = fan[fan_index].connected;
   out->start_count = fan[fan_index].start_count;
   out->cooldown    = (uint8_t)(fan[fan_index].cooldown_tick != 0);
   out->coast_pct   = (uint16_t)(Fan_CoastDuty(fan_index, HAL_GetTick()) / DUTY_SCALE);
@@ -815,11 +874,19 @@ void Cooling_GetGlobalStatus(CoolingStatus *out)
     return;
   }
 
-  out->thermal_shutdown = thermal_shutdown;
-  out->temp_valid[0]    = temp_valid[0];
-  out->temp_valid[1]    = temp_valid[1];
-  out->temp_over[0]     = temp_over[0];
-  out->temp_over[1]     = temp_over[1];
+  ThermalStatus th = {0};
+  Thermal_GetStatus(&th);
+
+  out->thermal_shutdown = th.limit;
+  out->temp_valid[0]    = th.valid[0];
+  out->temp_valid[1]    = th.valid[1];
+  out->temp_over[0]     = th.over[0];
+  out->temp_over[1]     = th.over[1];
+  out->temp_c[0]        = th.temp_c[0];
+  out->temp_c[1]        = th.temp_c[1];
+  out->trip_c           = th.trip_c;
+  out->clear_c          = th.clear_c;
+  out->no_sensor        = th.no_sensor;
   out->cmd_raw          = cmd_raw;
   out->cmd_active       = cmd_effective;
 }
